@@ -1,0 +1,3 @@
+/Users/sanjaymishra/deterministic-trading/build/CMakeFiles/benchmark.dir
+/Users/sanjaymishra/deterministic-trading/build/CMakeFiles/edit_cache.dir
+/Users/sanjaymishra/deterministic-trading/build/CMakeFiles/rebuild_cache.dir
