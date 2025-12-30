@@ -20,27 +20,26 @@
 // CONFIGURATION
 // ============================================================================
 constexpr size_t QUEUE_SIZE = 8192;
-constexpr size_t NUM_ORDERS = 100000;
-constexpr size_t WARMUP_ORDERS = 10000;
-constexpr size_t NUM_RUNS = 5;
+constexpr size_t NUM_ORDERS = 1000000;
+constexpr size_t WARMUP_ORDERS = 100000;
 
 // ============================================================================
 // ORDER STRUCTURE
 // ============================================================================
 struct Order {
     uint64_t order_id;
-    uint64_t timestamp_in;
-    uint64_t timestamp_out;
+    uint64_t timestamp_in;   // When order entered queue
+    uint64_t timestamp_out;  // When order exited queue
     double price;
     int quantity;
-    char side; // 'B' or 'S'
+    char side;
     
     Order() : order_id(0), timestamp_in(0), timestamp_out(0), 
               price(0.0), quantity(0), side('B') {}
 };
 
 // ============================================================================
-// HIGH-PRECISION TIMING (ARM64 macOS)
+// HIGH-PRECISION TIMING
 // ============================================================================
 class Timer {
 private:
@@ -51,7 +50,8 @@ public:
 #ifdef __APPLE__
         mach_timebase_info_data_t info;
         mach_timebase_info(&info);
-        conversion_factor_ = static_cast<double>(info.numer) / info.denom;
+        conversion_factor_ = static_cast<double>(info.numer) / 
+                           static_cast<double>(info.denom);
 #else
         conversion_factor_ = 1.0;
 #endif
@@ -61,7 +61,10 @@ public:
 #ifdef __APPLE__
         return mach_absolute_time();
 #else
-        return std::chrono::steady_clock::now().time_since_epoch().count();
+        auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()
+        ).count();
 #endif
     }
     
@@ -71,7 +74,7 @@ public:
 };
 
 // ============================================================================
-// LOCK-FREE QUEUE (ARM64 Optimized)
+// LOCK-FREE QUEUE
 // ============================================================================
 template<typename T, size_t Size>
 class LockFreeQueue {
@@ -88,7 +91,6 @@ public:
         size_t head = head_.load(std::memory_order_relaxed);
         size_t next_head = (head + 1) & (Size - 1);
         
-        // Check if queue is full
         if (next_head == tail_.load(std::memory_order_acquire))
             return false;
         
@@ -100,7 +102,6 @@ public:
     bool try_pop(T& item) {
         size_t tail = tail_.load(std::memory_order_relaxed);
         
-        // Check if queue is empty
         if (tail == head_.load(std::memory_order_acquire))
             return false;
         
@@ -111,7 +112,7 @@ public:
 };
 
 // ============================================================================
-// BASELINE: MUTEX-BASED QUEUE
+// MUTEX-BASED QUEUE
 // ============================================================================
 template<typename T>
 class MutexQueue {
@@ -137,7 +138,7 @@ public:
 };
 
 // ============================================================================
-// STATISTICS CALCULATOR
+// STATISTICS
 // ============================================================================
 class Statistics {
 private:
@@ -150,6 +151,10 @@ public:
     
     void clear() {
         data_.clear();
+    }
+    
+    const std::vector<double>& get_data() const {
+        return data_;
     }
     
     double mean() const {
@@ -197,9 +202,8 @@ private:
     QueueType queue_;
     Statistics stats_;
     std::atomic<bool> producer_done_{false};
-    std::atomic<size_t> orders_processed_{0};
     
-    void producer_thread(size_t num_orders, bool is_warmup) {
+    void producer_thread(size_t num_orders) {
         std::mt19937_64 rng(std::random_device{}());
         std::uniform_real_distribution<double> price_dist(100.0, 200.0);
         std::uniform_int_distribution<int> qty_dist(100, 10000);
@@ -207,13 +211,15 @@ private:
         for (size_t i = 0; i < num_orders; ++i) {
             Order order;
             order.order_id = i;
-            order.timestamp_in = timer_.now();
             order.price = price_dist(rng);
             order.quantity = qty_dist(rng);
             order.side = (i % 2 == 0) ? 'B' : 'S';
             
+            // Timestamp JUST before pushing to queue
+            order.timestamp_in = timer_.now();
+            
             while (!queue_.try_push(order)) {
-                std::this_thread::yield();
+                // Spin without yield to maintain timing accuracy
             }
         }
         
@@ -226,9 +232,10 @@ private:
         
         while (processed < num_orders) {
             if (queue_.try_pop(order)) {
+                // Timestamp IMMEDIATELY after popping
                 order.timestamp_out = timer_.now();
                 
-                // Calculate latency in nanoseconds
+                // Calculate latency (queue traversal time)
                 double latency_ns = timer_.to_nanoseconds(
                     order.timestamp_out - order.timestamp_in
                 );
@@ -238,10 +245,8 @@ private:
                 }
                 
                 processed++;
-                orders_processed_.store(processed, std::memory_order_relaxed);
-            } else {
-                std::this_thread::yield();
             }
+            // No yield - keep spinning for accurate timing
         }
     }
     
@@ -251,17 +256,14 @@ public:
         
         if (!is_warmup) {
             stats_.clear();
-            orders_processed_.store(0);
         }
         
         producer_done_.store(false);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
-        std::thread producer(&BenchmarkRunner::producer_thread, this, 
-                           num_orders, is_warmup);
-        std::thread consumer(&BenchmarkRunner::consumer_thread, this, 
-                           num_orders, is_warmup);
+        std::thread producer(&BenchmarkRunner::producer_thread, this, num_orders);
+        std::thread consumer(&BenchmarkRunner::consumer_thread, this, num_orders, is_warmup);
         
         producer.join();
         consumer.join();
@@ -303,9 +305,10 @@ public:
         file << "latency_ns\n";
         file << std::fixed << std::setprecision(2);
         
-        // Export raw data for external analysis
-        for (size_t i = 0; i < stats_.count(); ++i) {
-            file << stats_.percentile(static_cast<double>(i) / stats_.count()) << "\n";
+        // Export raw data directly (much faster)
+        const auto& data = stats_.get_data();
+        for (double val : data) {
+            file << val << "\n";
         }
         
         file.close();
@@ -325,34 +328,34 @@ int main() {
     std::cout << "  Queue Size:     " << QUEUE_SIZE << "\n";
     std::cout << "  Orders/Run:     " << NUM_ORDERS << "\n";
     std::cout << "  Warmup Orders:  " << WARMUP_ORDERS << "\n";
-    std::cout << "  Num Runs:       " << NUM_RUNS << "\n";
     std::cout << "========================================\n";
     
-    // Run Mutex-Based Baseline
+    std::cout << "\n⚠️  IMPORTANT: This will run for ~30 seconds\n";
+    std::cout << "Close all other applications for best results.\n";
+    std::cout << "Press Enter to continue...";
+    std::cin.get();
+    
+    // Baseline
     {
         std::cout << "\n[1/2] Running BASELINE (Mutex-Based Queue)...\n";
         BenchmarkRunner<MutexQueue<Order>> baseline;
         
-        // Warmup
         std::cout << "  Warming up...\n";
         baseline.run_benchmark("Warmup", true);
         
-        // Actual benchmark
         std::cout << "  Running benchmark...\n";
         baseline.run_benchmark("Mutex-Based Queue");
         baseline.export_csv("baseline_results.csv");
     }
     
-    // Run Lock-Free Optimized
+    // Lock-Free
     {
         std::cout << "\n[2/2] Running PROPOSED (Lock-Free Queue)...\n";
         BenchmarkRunner<LockFreeQueue<Order, QUEUE_SIZE>> optimized;
         
-        // Warmup
         std::cout << "  Warming up...\n";
         optimized.run_benchmark("Warmup", true);
         
-        // Actual benchmark
         std::cout << "  Running benchmark...\n";
         optimized.run_benchmark("Lock-Free ARM64 Queue");
         optimized.export_csv("lockfree_results.csv");
@@ -360,7 +363,6 @@ int main() {
     
     std::cout << "\n========================================\n";
     std::cout << "Benchmark Complete!\n";
-    std::cout << "Results exported to CSV files.\n";
     std::cout << "========================================\n";
     
     return 0;
